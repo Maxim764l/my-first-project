@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Живая планета</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; font-family: system-ui, sans-serif; }
+  canvas { display: block; width: 100vw; height: 100vh; cursor: grab; touch-action: none; }
+  canvas.dragging { cursor: grabbing; }
+  #ui {
+    position: fixed; left: 16px; bottom: 16px; color: #cfe3ff; font-size: 13px; line-height: 1.6;
+    background: rgba(10, 20, 40, .45); padding: 10px 14px; border-radius: 10px; backdrop-filter: blur(4px);
+    user-select: none;
+  }
+  #ui button {
+    margin-top: 6px; margin-right: 6px; background: #1d3b6b; color: #fff; border: 1px solid #3c6bb0;
+    border-radius: 6px; padding: 4px 10px; cursor: pointer; font: inherit;
+  }
+  #ui button:hover { background: #28508f; }
+  #err { position: fixed; inset: 0; display: none; place-items: center; color: #fff; text-align: center; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="ui">
+  Тяните мышью — вращение · колесо — масштаб<br>
+  <button id="newBtn">Новая планета (N)</button><button id="pauseBtn">Пауза (Пробел)</button>
+</div>
+<div id="err">Ваш браузер не поддерживает WebGL.</div>
+
+<script id="vs" type="x-shader/x-vertex">
+attribute vec2 aPos;
+void main() { gl_Position = vec4(aPos, 0.0, 1.0); }
+</script>
+
+<script id="fs" type="x-shader/x-fragment">
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+
+uniform vec2  uRes;
+uniform float uTime;
+uniform float uDist;
+uniform mat3  uRot;   // object -> world
+uniform vec3  uSun;
+uniform vec3  uSeed;
+
+// Ashima Arts 3D simplex noise (MIT)
+vec3 mod289(vec3 x){ return x - floor(x * (1.0/289.0)) * 289.0; }
+vec4 mod289(vec4 x){ return x - floor(x * (1.0/289.0)) * 289.0; }
+vec4 permute(vec4 x){ return mod289(((x*34.0)+1.0)*x); }
+vec4 taylorInvSqrt(vec4 r){ return 1.79284291400159 - 0.85373472095314 * r; }
+float snoise(vec3 v){
+  const vec2 C = vec2(1.0/6.0, 1.0/3.0);
+  const vec4 D = vec4(0.0, 0.5, 1.0, 2.0);
+  vec3 i  = floor(v + dot(v, C.yyy));
+  vec3 x0 = v - i + dot(i, C.xxx);
+  vec3 g = step(x0.yzx, x0.xyz);
+  vec3 l = 1.0 - g;
+  vec3 i1 = min(g.xyz, l.zxy);
+  vec3 i2 = max(g.xyz, l.zxy);
+  vec3 x1 = x0 - i1 + C.xxx;
+  vec3 x2 = x0 - i2 + C.yyy;
+  vec3 x3 = x0 - D.yyy;
+  i = mod289(i);
+  vec4 p = permute(permute(permute(
+            i.z + vec4(0.0, i1.z, i2.z, 1.0))
+          + i.y + vec4(0.0, i1.y, i2.y, 1.0))
+          + i.x + vec4(0.0, i1.x, i2.x, 1.0));
+  float n_ = 0.142857142857;
+  vec3 ns = n_ * D.wyz - D.xzx;
+  vec4 j = p - 49.0 * floor(p * ns.z * ns.z);
+  vec4 x_ = floor(j * ns.z);
+  vec4 y_ = floor(j - 7.0 * x_);
+  vec4 x = x_ * ns.x + ns.yyyy;
+  vec4 y = y_ * ns.x + ns.yyyy;
+  vec4 h = 1.0 - abs(x) - abs(y);
+  vec4 b0 = vec4(x.xy, y.xy);
+  vec4 b1 = vec4(x.zw, y.zw);
+  vec4 s0 = floor(b0)*2.0 + 1.0;
+  vec4 s1 = floor(b1)*2.0 + 1.0;
+  vec4 sh = -step(h, vec4(0.0));
+  vec4 a0 = b0.xzyw + s0.xzyw*sh.xxyy;
+  vec4 a1 = b1.xzyw + s1.xzyw*sh.zzww;
+  vec3 p0 = vec3(a0.xy, h.x);
+  vec3 p1 = vec3(a0.zw, h.y);
+  vec3 p2 = vec3(a1.xy, h.z);
+  vec3 p3 = vec3(a1.zw, h.w);
+  vec4 norm = taylorInvSqrt(vec4(dot(p0,p0), dot(p1,p1), dot(p2,p2), dot(p3,p3)));
+  p0 *= norm.x; p1 *= norm.y; p2 *= norm.z; p3 *= norm.w;
+  vec4 m = max(0.6 - vec4(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3)), 0.0);
+  m = m * m;
+  return 42.0 * dot(m*m, vec4(dot(p0,x0), dot(p1,x1), dot(p2,x2), dot(p3,x3)));
+}
+
+float hash(vec3 p){ return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))) * 43758.5453); }
+
+float terrain(vec3 p){
+  p += uSeed;
+  vec3 q = p * 1.2 + 0.45 * snoise(p * 0.7 + 3.1);
+  float f = 0.0, a = 0.5;
+  for (int i = 0; i < 6; i++) {
+    f += a * snoise(q);
+    q = q * 2.03 + vec3(1.7, 9.2, 3.1);
+    a *= 0.5;
+  }
+  float r = 1.0 - abs(snoise(p * 3.0));
+  return f + 0.3 * r * r * smoothstep(0.08, 0.3, f);
+}
+
+float clouds(vec3 p){
+  float t = uTime * 0.015;
+  float c = cos(t), s = sin(t);
+  p = vec3(c * p.x - s * p.z, p.y, s * p.x + c * p.z); // clouds drift faster than the ground
+  p = p * 2.2 + uSeed.zxy;
+  p += 0.5 * snoise(p * 0.6 + vec3(0.0, 0.0, uTime * 0.03));
+  float f = 0.0, a = 0.5;
+  for (int i = 0; i < 5; i++) {
+    f += a * snoise(p);
+    p = p * 2.1 + vec3(4.3, 1.1, 7.7);
+    a *= 0.5;
+  }
+  return smoothstep(0.0, 0.5, f + 0.05);
+}
+
+const float SEA = 0.05;
+
+vec3 planet(vec3 n, vec3 rd){
+  vec3 op = n * uRot;                 // world -> object (transpose)
+  float h = terrain(op);
+  bool water = h < SEA;
+  float hl = max(h - SEA, 0.0);
+
+  // Bump-mapped normal for land only
+  vec3 bn = op;
+  if (!water) {
+    vec3 t1 = normalize(cross(op, abs(op.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0)));
+    vec3 t2 = cross(op, t1);
+    float e = 0.003;
+    float h1 = max(terrain(normalize(op + e * t1)) - SEA, 0.0);
+    float h2 = max(terrain(normalize(op + e * t2)) - SEA, 0.0);
+    bn = normalize(op - 0.035 * ((h1 - hl) / e * t1 + (h2 - hl) / e * t2));
+  }
+  vec3 N = uRot * bn;
+
+  float lat = abs(op.y);
+  float moist = snoise(op * 1.7 + uSeed + 50.0) * 0.5 + 0.5;
+  float temp = 1.0 - lat * 1.15 - hl * 1.2 + snoise(op * 2.5 + uSeed + 80.0) * 0.12;
+
+  vec3 snow = vec3(0.93, 0.96, 1.0);
+  vec3 col;
+  if (water) {
+    float d = SEA - h;
+    col = mix(vec3(0.06, 0.38, 0.52), vec3(0.01, 0.06, 0.20), smoothstep(0.0, 0.3, d));
+  } else {
+    vec3 sand   = vec3(0.78, 0.71, 0.52);
+    vec3 grass  = vec3(0.25, 0.48, 0.16);
+    vec3 forest = vec3(0.08, 0.27, 0.09);
+    vec3 desert = vec3(0.80, 0.60, 0.36);
+    vec3 tundra = vec3(0.45, 0.47, 0.38);
+    vec3 rock   = vec3(0.36, 0.31, 0.27);
+    vec3 low = mix(desert, mix(grass, forest, smoothstep(0.5, 0.75, moist)), smoothstep(0.32, 0.48, moist));
+    low = mix(tundra, low, smoothstep(0.25, 0.45, temp));
+    col = mix(sand, low, smoothstep(0.0, 0.025, hl));
+    col = mix(col, rock, smoothstep(0.22, 0.36, hl));
+    col = mix(col, snow, smoothstep(0.42, 0.52, hl));
+  }
+  float ice = smoothstep(0.12, 0.02, temp);
+  col = mix(col, snow, ice);
+
+  float geomDiff = dot(n, uSun);
+  float day = smoothstep(-0.12, 0.15, geomDiff);
+  float diff = max(dot(N, uSun), 0.0) * day;
+
+  float cl = clouds(op);
+  float shadow = clouds(normalize(op + (uSun * uRot) * 0.02));
+
+  vec3 lit = col * (0.015 + 1.1 * diff * (1.0 - 0.45 * shadow));
+
+  if (water && ice < 0.5) {
+    vec3 hv = normalize(uSun - rd);
+    lit += vec3(1.0, 0.9, 0.75) * pow(max(dot(N, hv), 0.0), 70.0) * 0.8 * day * (1.0 - cl);
+  }
+
+  // City lights on the night side
+  if (!water) {
+    float city = smoothstep(0.55, 0.9, snoise(op * 38.0 + uSeed));
+    city *= smoothstep(0.15, 0.55, snoise(op * 5.0 + uSeed + 5.0));
+    city *= (1.0 - ice) * (1.0 - smoothstep(0.15, 0.3, hl));
+    lit += vec3(1.0, 0.72, 0.38) * city * (1.0 - day) * (1.0 - 0.8 * cl) * 1.4;
+  }
+
+  vec3 cloudCol = vec3(1.0) * (0.02 + 1.05 * max(geomDiff, 0.0));
+  lit = mix(lit, cloudCol, cl * 0.92);
+
+  // Atmospheric rim
+  float rim = pow(1.0 - max(dot(n, -rd), 0.0), 3.0);
+  float sunSide = smoothstep(-0.35, 0.5, geomDiff);
+  lit += vec3(0.30, 0.58, 1.0) * rim * sunSide * 0.9;
+  lit = mix(lit, lit + vec3(0.05, 0.1, 0.2) * day, 0.5);
+  return lit;
+}
+
+vec3 background(vec3 rd){
+  vec3 c = vec3(0.0);
+  vec3 cell = floor(rd * 520.0);
+  float h = hash(cell);
+  if (h > 0.9975) {
+    float tw = 0.6 + 0.4 * sin(uTime * (1.5 + 3.0 * hash(cell + 7.0)) + h * 100.0);
+    c += vec3(0.8 + 0.2 * hash(cell + 1.0), 0.85, 1.0) * tw * (h - 0.9975) * 400.0;
+  }
+  float neb = snoise(rd * 2.0 + 10.0) * 0.5 + 0.5;
+  c += vec3(0.04, 0.02, 0.08) * neb * neb + vec3(0.0, 0.02, 0.05) * pow(snoise(rd * 3.5) * 0.5 + 0.5, 3.0);
+  float s = max(dot(rd, uSun), 0.0);
+  c += vec3(1.0, 0.9, 0.7) * (pow(s, 2000.0) * 3.0 + pow(s, 40.0) * 0.15);
+  return c;
+}
+
+void main(){
+  vec2 uv = (gl_FragCoord.xy - 0.5 * uRes) / uRes.y;
+  vec3 ro = vec3(0.0, 0.0, uDist);
+  vec3 rd = normalize(vec3(uv, -1.6));
+
+  float b = dot(ro, rd);
+  float c = dot(ro, ro) - 1.0;
+  float closest = sqrt(max(dot(ro, ro) - b * b, 0.0));
+  float aa = 1.5 * uDist / (1.6 * uRes.y);
+
+  vec3 col = background(rd);
+
+  // Outer atmosphere glow, brighter on the sunlit side
+  if (b < 0.0) {
+    vec3 cp = ro - rd * b;
+    float sunSide = smoothstep(-0.4, 0.6, dot(normalize(cp), uSun));
+    float g = exp(-max(closest - 1.0, 0.0) * 14.0) * smoothstep(1.0 - aa, 1.0 + aa, closest);
+    col += vec3(0.30, 0.58, 1.0) * g * (0.08 + 0.9 * sunSide);
+  }
+
+  if (closest < 1.0 && b < 0.0) {
+    float t = -b - sqrt(max(b * b - c, 0.0));
+    vec3 n = normalize(ro + rd * t);
+    vec3 p = planet(n, rd);
+    col = mix(col, p, smoothstep(1.0, 1.0 - aa, closest));
+  }
+
+  col = 1.0 - exp(-col * 1.4);              // tone map
+  col = pow(col, vec3(1.0 / 1.1));
+  gl_FragColor = vec4(col, 1.0);
+}
+</script>
+
+<script>
+(() => {
+  const canvas = document.getElementById('c');
+  const gl = canvas.getContext('webgl', { antialias: false });
+  if (!gl) { document.getElementById('err').style.display = 'grid'; return; }
+
+  function compile(type, src) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    return s;
+  }
+  const prog = gl.createProgram();
+  gl.attachShader(prog, compile(gl.VERTEX_SHADER, document.getElementById('vs').textContent));
+  gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, document.getElementById('fs').textContent));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+  gl.useProgram(prog);
+
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+  const aPos = gl.getAttribLocation(prog, 'aPos');
+  gl.enableVertexAttribArray(aPos);
+  gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+  const U = {};
+  ['uRes', 'uTime', 'uDist', 'uRot', 'uSun', 'uSeed'].forEach(n => U[n] = gl.getUniformLocation(prog, n));
+
+  // ---- 3x3 matrices, row-major ----
+  const mul = (a, b) => {
+    const r = new Array(9);
+    for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++)
+      r[i * 3 + j] = a[i * 3] * b[j] + a[i * 3 + 1] * b[3 + j] + a[i * 3 + 2] * b[6 + j];
+    return r;
+  };
+  const rotX = a => { const c = Math.cos(a), s = Math.sin(a); return [1, 0, 0, 0, c, -s, 0, s, c]; };
+  const rotY = a => { const c = Math.cos(a), s = Math.sin(a); return [c, 0, s, 0, 1, 0, -s, 0, c]; };
+  const rotZ = a => { const c = Math.cos(a), s = Math.sin(a); return [c, -s, 0, s, c, 0, 0, 0, 1]; };
+  function orthonormalize(m) {
+    let x = [m[0], m[3], m[6]], y = [m[1], m[4], m[7]];
+    const len = v => Math.hypot(v[0], v[1], v[2]);
+    let l = len(x); x = x.map(v => v / l);
+    const d = x[0] * y[0] + x[1] * y[1] + x[2] * y[2];
+    y = y.map((v, i) => v - d * x[i]); l = len(y); y = y.map(v => v / l);
+    const z = [x[1] * y[2] - x[2] * y[1], x[2] * y[0] - x[0] * y[2], x[0] * y[1] - x[1] * y[0]];
+    return [x[0], y[0], z[0], x[1], y[1], z[1], x[2], y[2], z[2]];
+  }
+  const toColumnMajor = m => new Float32Array([m[0], m[3], m[6], m[1], m[4], m[7], m[2], m[5], m[8]]);
+
+  // Axial tilt so the planet's own spin looks natural
+  let R = mul(rotX(0.35), rotZ(0.41));
+  const sun = (() => { const v = [1.0, 0.3, 0.45]; const l = Math.hypot(...v); return v.map(x => x / l); })();
+  let seed = [0, 0, 0];
+  const newSeed = () => { seed = [Math.random() * 200 - 100, Math.random() * 200 - 100, Math.random() * 200 - 100]; };
+  newSeed();
+
+  let dist = 4.3, targetDist = 4.3;
+  let velX = 0, velY = 0;          // inertia, rad/s around world X/Y
+  let dragging = false, lastMove = 0;
+  let paused = false, time = 0;
+  const spin = 0.12;               // own-axis spin, rad/s
+  const pointers = new Map();
+  let pinchDist = 0;
+
+  canvas.addEventListener('pointerdown', e => {
+    canvas.setPointerCapture(e.pointerId);
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pointers.size === 2) {
+      const [a, b] = [...pointers.values()];
+      pinchDist = Math.hypot(a.x - b.x, a.y - b.y);
+    }
+    dragging = true; velX = velY = 0; lastMove = performance.now();
+    canvas.classList.add('dragging');
+  });
+  canvas.addEventListener('pointermove', e => {
+    const p = pointers.get(e.pointerId);
+    if (!p) return;
+    const dx = e.clientX - p.x, dy = e.clientY - p.y;
+    p.x = e.clientX; p.y = e.clientY;
+    if (pointers.size === 2) {
+      const [a, b] = [...pointers.values()];
+      const d = Math.hypot(a.x - b.x, a.y - b.y);
+      if (pinchDist > 0) targetDist = clampDist(targetDist * pinchDist / d);
+      pinchDist = d;
+      return;
+    }
+    const k = 2.2 / Math.min(canvas.clientWidth, canvas.clientHeight) * (dist - 1) / 2.2;
+    const ax = dy * k, ay = dx * k;
+    R = mul(rotX(ax), mul(rotY(ay), R));
+    const now = performance.now(), dt = Math.max((now - lastMove) / 1000, 1 / 240);
+    velX = 0.7 * velX + 0.3 * ax / dt;
+    velY = 0.7 * velY + 0.3 * ay / dt;
+    lastMove = now;
+  });
+  const release = e => {
+    pointers.delete(e.pointerId);
+    if (pointers.size < 2) pinchDist = 0;
+    if (pointers.size === 0) {
+      dragging = false;
+      canvas.classList.remove('dragging');
+      if (performance.now() - lastMove > 80) velX = velY = 0; // held still before release
+    }
+  };
+  canvas.addEventListener('pointerup', release);
+  canvas.addEventListener('pointercancel', release);
+
+  const clampDist = d => Math.min(8, Math.max(1.6, d));
+  canvas.addEventListener('wheel', e => {
+    e.preventDefault();
+    targetDist = clampDist(targetDist * Math.exp(e.deltaY * 0.001));
+  }, { passive: false });
+
+  const pauseBtn = document.getElementById('pauseBtn');
+  const togglePause = () => { paused = !paused; pauseBtn.textContent = paused ? 'Продолжить (Пробел)' : 'Пауза (Пробел)'; };
+  document.getElementById('newBtn').addEventListener('click', newSeed);
+  pauseBtn.addEventListener('click', togglePause);
+  window.addEventListener('keydown', e => {
+    if (e.code === 'KeyN') newSeed();
+    if (e.code === 'Space') { e.preventDefault(); togglePause(); }
+  });
+
+  function resize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+    const w = Math.floor(canvas.clientWidth * dpr), h = Math.floor(canvas.clientHeight * dpr);
+    if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+    gl.viewport(0, 0, w, h);
+  }
+
+  let prev = performance.now();
+  function frame(now) {
+    const dt = Math.min((now - prev) / 1000, 0.1);
+    prev = now;
+    resize();
+
+    if (!paused) {
+      time += dt;
+      R = mul(R, rotY(spin * dt)); // spin around the planet's own axis
+    }
+    if (!dragging) {
+      R = mul(rotX(velX * dt), mul(rotY(velY * dt), R));
+      const decay = Math.exp(-dt * 2.5);
+      velX *= decay; velY *= decay;
+    }
+    R = orthonormalize(R);
+    dist += (targetDist - dist) * (1 - Math.exp(-dt * 8));
+
+    gl.uniform2f(U.uRes, canvas.width, canvas.height);
+    gl.uniform1f(U.uTime, time);
+    gl.uniform1f(U.uDist, dist);
+    gl.uniformMatrix3fv(U.uRot, false, toColumnMajor(R));
+    gl.uniform3fv(U.uSun, sun);
+    gl.uniform3fv(U.uSeed, seed);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
